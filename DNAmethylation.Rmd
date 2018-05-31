@@ -1,0 +1,829 @@
+---
+title: "DNA methylation analysis"
+author: "Jakub Orzechowski Westholm"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '~/tmp/') ## Change this to appropriate directory
+```
+
+```{r sys_date}
+cat(paste(Sys.Date()))
+```
+
+Load libraries
+```{r libs, message=FALSE, warning=FALSE}
+library(knitr)
+library(data.table)
+library(tidyverse)
+library(minfi)
+library(minfiData)
+library(sva)
+library(doParallel)
+library(limma)
+library(DMRcate)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19) 
+library(IlluminaHumanMethylation450kmanifest)
+library(RColorBrewer)
+library(ChIPpeakAnno)
+library(EnsDb.Hsapiens.v75)
+library(biomaRt)
+library(pheatmap)
+library(ggplot2)
+library(gridExtra)
+```
+
+
+## Helper functions
+
+### Normalization
+```{r norm_functions}
+## Run ComBat on a GenomicRatioSet to remove batch effects.
+## In:
+## - A GenomicRatioSet
+## - An array with the same length as the number of experiments 
+##   in the GenomicRatioSet, with the batch for each experiment.
+## Out:
+## - A new GenomicRatioSet, after correction of batch effects.
+combat.on.grset <- function(GRset, batch){
+	pheno <- pData(GRset)
+	combat.model = model.matrix(~1, data=pheno)
+	Ms_combat=ComBat(dat=getM(GRset), batch=batch, mod=combat.model)	
+	
+	tmp = RatioSet(M=Ms_combat, metadata=pheno)
+	annotation(tmp) = annotation(MsetEx)
+	GRset = mapToGenome(tmp)
+	
+	return(GRset)
+}
+
+# Use minfi quantile normalization, then filter probes and correct batch effects.
+## Input:
+## - A sample table
+## - Remove probes with detection p-values above this cutoff (defualt is 0.01)
+## - A table with non-specific probes
+## - If probes with SNPS should be dropped (defualt is TRUE)
+## - If we should run ComBat to correct for batch effects (defualt is TRUE)
+## Output:
+## - A GenomicRatioSet object, after quantile normalization and filtering of probes.
+minfi.filter.and.normalize.by.tissue <- function(sample.table, detection.pval=0.01, drop.snps=TRUE, non.specific.probe.tab=NULL, run.combat=TRUE){
+	RGSet <- read.metharray.exp(targets = sample.table)
+	
+	GRset.quantile <- preprocessQuantile(RGSet, fixOutliers = TRUE, removeBadSamples = TRUE, badSampleCutoff = 10.5, quantileNormalize = TRUE, stratified = TRUE, mergeManifest = FALSE, sex = NULL)
+
+	# Filter on detection p-values	
+	if(detection.pval<1){
+		detP <- detectionP(RGSet)
+		# ensure probes are in the same order in the mSetSq and detP objects
+		detP <- detP[match(featureNames(GRset.quantile),rownames(detP)),]
+		# remove any probes that have failed in one or more samples
+		keep <- rowSums(detP < detection.pval) == ncol(GRset.quantile)
+		GRset.quantile <- GRset.quantile[keep,]	
+	}
+
+	# Remove probes overlapping SNPs
+	if(drop.snps){
+		GRset.quantile  <- dropLociWithSnps(GRset.quantile , snps=c("SBE","CpG"), maf=0)
+	}	
+	
+	# Remove non-specific probes
+	if(!is.null(non.specific.probe.tab)){
+		keep <- !(featureNames(GRset.quantile) %in% non.specific.probe.tab$TargetID)
+		GRset.quantile <- GRset.quantile[keep,]	
+	}
+	
+	if(run.combat){
+		GRset.quantile <- combat.on.grset(GRset.quantile, batch=pData(GRset.quantile)$Sentrix_ID)
+	}
+	
+	return(GRset.quantile)
+}
+
+```
+
+### QC plot functions
+```{r qc_functions}
+## Input:
+## - A GenomicRatioSet object
+## - Which tissue we are looking at (used as header)
+## Output:
+## - Density plot and density bean plot
+minfi.qc.plot.by.tissue <- function(GRset,  sample.sheet, tissue="", sleep.column="Sleep"){
+	densityPlot(getBeta(GRset), sampGroups = factor( sample.sheet[,sleep.column]), main=tissue)
+	
+	op <- par(mar=c(5,7,4,2)+0.1)
+	densityBeanPlot(getBeta(GRset), sampGroups = factor(sample.sheet[,sleep.column]),
+									sampNames=sample.sheet$Sample_Name, main=tissue)
+	par(op)
+}
+```
+
+### Methods for DMRs
+
+```{r dmr_functions}
+## Uses the DMRcate algorithm to find differentially methyltaed regions.
+## In:
+## - A GenomicRatioSet object
+## - A string describing which model to use
+## - A string describing the contrast to consider
+## - FDR cutoff on differentially methylated probes (default is 0.05)
+## - Fold change cutoff on differentially methylated regions (default is 0.02)
+## - P-value (Stouffer) cutoff on differentially methylated regions (default is 0.05)
+## - lamda: bandwidth to gaussian kernel smoothing function (default is 1000)
+## - C: Scaling factor for bandwidth
+## Out:
+## - A GRanges object with info on all DMRs.
+dmrcate.dmrs <- function(GRset, sample.sheet, use.model, contrast, cpg.fdr=0.05, dmr.fc=0.02, dmr.fdr=0.05, lambda=1000, C=2){
+	designMatrix <- model.matrix(as.formula(use.model), data=sample.sheet) 
+
+		
+	contMatrix <- makeContrasts(contrasts=contrast, levels=designMatrix)
+	
+	myAnnotation <- cpg.annotate(GRset, datatype = "array", analysis.type="differential", design=designMatrix, arraytype="450K", contrasts = TRUE, cont.matrix = contMatrix, coef=contrast, fdr = cpg.fdr)
+	
+	
+	## If no DMRs are found, dmrcate throws an error. We need to catch this so the programs doesn't crash.
+	## Instead we now return an empty GRanges object.
+	DMRs <- tryCatch(
+		dmrcate(myAnnotation, lambda=lambda, C=C), 
+		error = function(e)
+			{ ## Of no DMRs found, return NULL
+			print(e$message)
+			return(GRanges())
+		}
+	)
+	
+	if(!(class(DMRs) == "GRanges")){
+		results.ranges <- extractRanges(DMRs, genome = "hg19")
+		results.ranges <- results.ranges[abs(results.ranges$meanbetafc) > dmr.fc & results.ranges$Stouffer < dmr.fdr,]
+		
+		return(results.ranges)
+	}
+	else{
+		return(DMRs)
+	}
+}
+
+## Uses limma algorithm to find differentially methyltaed CpGc/probes.
+## In:
+## - A GenomicRatioSet object
+## - A string describing which model to use
+## - A string describing the contrast to consider
+## - The number of most significant CpGs to return
+## Out:
+## - A a table with the most significant CpGs, and the following columns:
+##  ID, CHR, pos, logFC, AveExpr, t, P.Value, adj.P.Val, B
+diff.cpgs <- function(GRset, sample.sheet, use.model, contrast, nr.cpgs=20){
+	designMatrix <- model.matrix(as.formula(use.model), data=sample.sheet) 
+	contMatrix <- makeContrasts(contrasts=contrast, levels=designMatrix)
+	
+	## Annotate CpGs.
+	cpg.fdr=1
+	myAnnotation <- cpg.annotate(GRset, datatype = "array", analysis.type="differential", design=designMatrix, arraytype="450K", contrasts = TRUE, cont.matrix = contMatrix, coef=contrast, fdr = cpg.fdr)
+	
+	myAnnotation.tab <- as.data.frame(lapply(myAnnotation,head, n=1e6))
+	rownames(myAnnotation.tab) <- myAnnotation.tab$ID
+
+	## Run limma on each CpG. 
+	fit <- lmFit(getBeta(GRset), designMatrix)
+	fit2  <- contrasts.fit(fit, contMatrix)
+	fit2  <- eBayes(fit2)
+	
+	## Format output
+	tt <- topTable(fit2,coef=1, number=nr.cpgs)
+	tt <- cbind(myAnnotation.tab[rownames(tt),c("CHR", "pos")], tt)
+	tt$logFC <- signif(tt$logFC, 2)
+	tt$AveExpr <- signif(tt$AveExpr, 2)
+	tt$P.Value <- signif(tt$P.Value, 2)
+	tt$adj.P.Val <- signif(tt$adj.P.Val, 2)
+	tt$B <- signif(tt$B, 2)
+	return(tt)
+}
+```
+
+
+### Functions to plot individual probes and DMRs
+```{r plot_functions}
+## Get probes included in a DMRs found by bumphunter
+## In:
+## - Which program was used to get DMRs ("bumphunter" or "dmrcate")
+## - DMRs (bumphunter output, bump object or DMRcate output, GRranges object)
+## - The GenomicRatioSet on whic bumphunter was run
+## - An index decribing wgich DMR we are interested in
+## - Direction of change (1 is more methylation, -1 is less methyltaion)
+## Out:
+## - An array with probe ids
+get.dmr.probes <- function(method, dmrs, GRset, which.dmr, change.dir){
+	dmr <- NULL
+	if(method == "bumphunter"){
+		dmr.tab <- dmrs$table[dmrs$table$value * change.dir > 0,]
+		
+		chr <- dmr.tab[which.dmr,"chr"]
+		start <- dmr.tab[which.dmr,"start"]
+		end <- dmr.tab[which.dmr,"end"]
+		dmr <- GRanges(seqnames = chr, ranges = IRanges(start = start, end = end))
+	}
+	if(method == "dmrcate"){
+		dmr <- dmrs[which.dmr,]
+	}	
+	
+	probeinfo <- makeGRangesFromDataFrame(minfi::getAnnotation(GRset), start.field = "pos", end.field = "pos", keep.extra.columns=TRUE)
+	GRanges.dmr <- probeinfo[from(GenomicRanges::findOverlaps(probeinfo, dmr, ignore.strand=TRUE)),]
+	return( names(GRanges.dmr) )
+}
+
+
+## Get mean beta values for all probes in a differentially methylated region (DMR).
+## Input:
+## - The differentially methyltaed regions, as a GRanges object
+## - The normalized methylation data, as a GenomicRatioSet object
+## - Information on all probes, as a GRanges object created by makeGRangesFromDataFrame
+## - Which DMR to get probes for, an intege index.
+## Out:
+## - An array mean beta values for a DMR, over all samples.
+get.dmr.betas <- function(dmrs, GRset, probeinfo, which.dmr ){
+	get.dmr.probes <- function(dmrs, GRset, which.dmr, probeinfo){
+		dmr <- dmrs[which.dmr,]
+		
+		GRanges.dmr <- probeinfo[from(GenomicRanges::findOverlaps(probeinfo, dmr, ignore.strand=TRUE)),]
+		return( names(GRanges.dmr) )
+	}
+	
+	betas <- getBeta(GRset)
+	dmr.probes <- get.dmr.probes(dmrs, GRset, which.dmr, probeinfo)
+	probe.betas <- betas[dmr.probes,]
+	dmr.betas <- apply(probe.betas, 2, mean)
+	
+	return(dmr.betas)
+}
+
+
+## Get differences in beta values for all probes in a differentially methylated region (DMR).
+## Input:
+## - The differentially methyltaed regions, as a GRanges object
+## - The normalized methylation data, as a GenomicRatioSet object. ASSUMES THAT THE SAMPLES ARE
+##   ORDERED AS FOLLOWS: subject1 control, subject1 treat, subject2 control, subject2 treat, ...
+## - Information on all probes, as a GRanges object created by makeGRangesFromDataFrame
+## - Which DMR to get probes for, an intege index.
+## Out:
+## - An with mean beta values differences for a DMR, for all subjects in the study.
+get.dmr.betas.change <- function(dmrs, GRset, probeinfo, which.dmr ){
+	get.dmr.probes <- function(dmrs, GRset, which.dmr, probeinfo){
+		dmr <- dmrs[which.dmr,]
+		
+		GRanges.dmr <- probeinfo[from(GenomicRanges::findOverlaps(probeinfo, dmr, ignore.strand=TRUE)),]
+		return( names(GRanges.dmr) )
+	}
+	
+	betas <- getBeta(GRset)
+	dmr.probes <- get.dmr.probes(dmrs, GRset, which.dmr, probeinfo)
+	probe.betas <- betas[dmr.probes,]
+	probe.beta.per.subject <- do.call("cbind", lapply(seq(from=1, to=30, by=2), function(i){ probe.betas[,i+1] - probe.betas[,i] }))
+	dmr.betas.per.subject <- apply(probe.beta.per.subject, 2, mean)
+	
+	return(dmr.betas.per.subject)
+}
+
+
+## Plots differnces in methylation levels between conditions, for a singe probe of a DMR.
+## Input:
+## - A GenomicRatioSet
+## - An id to plot, either a name of a probe in the GRset, or a name of a DMR in the GRanges object.
+## - A Granges object describing DRMs. (Optional, deafualt is NULL in which case the id is expected to be a probe id.)
+## - A title to put in the plot. (Default is NULL, in which case the id is used as a title).
+## - Which samples correspond to the sleep condition (default 1,3,5,..,29)
+## - Which samples correspond to the wake condition (default 2,4,6,..,30)
+plot.methylation.difference <- function(GRset, select.id, dmrs=NULL, main=NULL, sleep=seq(from=1, to=30, by=2), wake=seq(from=2, to=30, by=2)){
+	betas <- getBeta(GRset)
+	selected.betas <- NULL
+	
+	# If dmrs data is provided, assume we want to plot average over a dmr.
+	if(!is.null(dmrs)){
+		dmr.probes <- get.dmr.probes(method="dmrcate" , dmrs=dmrs, GRset=GRset, which.dmr=select.id)
+		probe.data <- betas[dmr.probes,]
+		selected.betas <- apply(probe.data,2,mean)
+	}
+	else{
+		selected.betas <- betas[select.id,]
+	}
+	
+	if(is.null(main)){
+		main <- select.id
+	}
+	
+	plot.data <- data.frame(sleep=pheno.data$Sleep[c(sleep,wake)], subject=pheno.data$Subject[c(sleep,wake)], beta=c(selected.betas[sleep], selected.betas[wake]))
+	
+	p <- ggplot(plot.data ) +
+		theme_classic() +
+		geom_violin(aes(x = sleep, y = beta, fill=sleep), trim=FALSE) +
+		geom_line(aes(x = sleep, y = beta, group = subject), size=0.2) +
+		ggtitle(main) +
+		xlab("")
+
+	return(p)
+}
+```
+
+
+### Functions for pathway analysis etc.
+```{r pathway_functions}
+
+## Given a set of genomic regions, resturns genes with TSS close to those regions.
+## Input:
+## - A set of genomic regions, GRanges
+## - Max distance between TSS and regions (defualt=5000bp)
+## - Annotation. GRanges object with 
+## Output:
+## - An array with (Ensembl) gene ids, of genes close to the given regions.
+## - An array with rownumbers of genomic regions that are close to the given Ensembl genes.
+annotate.regions.to.tss <- function(regions, maxgap=5000, annoData){
+	overlaps.anno <- annotatePeakInBatch(regions, AnnotationData=annoData, featureType="TSS", FeatureLocForDistance="TSS", select="all", output="nearestLocation", maxgap=maxgap)
+	
+	overlaps.anno$ensg <- annoData$gene_id[match(overlaps.anno$feature, annoData$tx_id)]
+	close.to.tss.indx <- abs(overlaps.anno$distancetoFeature)<= maxgap
+	
+	close.to.regions.ensg <- unique(overlaps.anno$ensg[close.to.tss.indx])
+	close.to.genes.region <- unique(overlaps.anno$peak[close.to.tss.indx])
+
+	peak.gene.tab <- data.frame(region=overlaps.anno$peak, ensg=overlaps.anno$ensg)
+	peak.gene.tab <- peak.gene.tab[close.to.tss.indx,] ## Only keep rows where probe is close to tss
+	peak.gene.tab <- peak.gene.tab[order(peak.gene.tab$region,peak.gene.tab$ensg),]
+	
+	## Create list mapping ensg ids <- probe ids
+	peak.gene.map <- split(x=as.character(peak.gene.tab$region), f=as.character(peak.gene.tab$ensg))
+
+	return(list(close.to.regions.ensg, close.to.genes.region, peak.gene.map))
+}
+
+
+## Convert an array of Ensembl gene ids to Entrez ids. Genes with missing ids are removed.
+## Input:
+## - An array with ensembl ids
+## - A table with columns ensembl_gene_id and entrezgene.
+## Output: An array with Entrez gene ids
+ensembl.set.to.entrez <- function(ensg.ids, gene.annot.tab){
+	entrez.ids <- gene.annot.tab$entrezgene[match(ensg.ids, gene.annot.tab$ensembl_gene_id)]
+	entrez.ids <- entrez.ids[!is.na(entrez.ids)]
+	return(entrez.ids)
+}
+
+
+## Get enriched GO and KEGG terms, given a set of differentially methylated regions (DMRs).
+## Input:
+## - A set of DMRs (GRanges)
+## - An array with (Ensembl) ids of all genes that have probes on the 450K array in the promoters.
+## - A table with columns ensembl_gene_id and entrezgene.
+## - Max Fisher p-value for enriched terms.
+## - Minimum nr of genes for enriched terms.
+## Output:
+## - A list of enriched terms for: GO/BP, GO/MF, GO/CC and KEGG.
+dmr.go.kegg <- function(dmrs, close.to.probe.ensembl, gene.annot.tab, annoData, fisher.cutoff=0.01, min.genes = 3){
+	get.top.terms <- function(enrich.obj, fisher.cutoff, min.genes){
+		enrich.obj[enrich.obj$P.DE< fisher.cutoff & enrich.obj$DE >= min.genes,]
+	}
+	
+	dmr.genes <- annotate.regions.to.tss(dmrs, maxgap=5000, annoData)[[1]]
+	
+	close.to.probe.entrez <- ensembl.set.to.entrez(close.to.probe.ensembl, gene.annot.tab)
+	dmr.genes.entrez <- ensembl.set.to.entrez(dmr.genes, gene.annot.tab) 
+	
+	go.fisher <- goana(dmr.genes.entrez, universe = close.to.probe.entrez, species = "Hs")
+	kegg.fisher <- kegga(dmr.genes.entrez, universe = close.to.probe.entrez, species = "Hs", FDR = 0.05)
+	
+	out.list <- list(
+		BP=get.top.terms(limma::topGO(go.fisher, number=100000, truncate.term=40, ontology = "BP"), fisher.cutoff, min.genes),
+		MF=get.top.terms(limma::topGO(go.fisher, number=100000, truncate.term=40, ontology = "MF"), fisher.cutoff, min.genes),
+		CC=get.top.terms(limma::topGO(go.fisher, number=100000, truncate.term=40, ontology = "CC"), fisher.cutoff, min.genes),
+		KEGG=get.top.terms(limma::topKEGG(kegg.fisher, number=100000), fisher.cutoff, min.genes)
+	)
+	
+	return(out.list)
+}
+```
+
+
+### Other functions
+
+```{r misc_functions}
+## Modified version of the function ChIPpeakAnno::assignChromosomeRegion.
+## Instread of returning percentage and jacard index of regions annotated to different
+## genomic features, an array with the feature for each input region is returned.
+## Input:
+## - the genomic regions to annoate (GRanges object)
+## - upstream cutoff for promoters (default 1000)
+## - downstream cutoff for promoters (default 1000)
+## - Precedence of genomic features, in case a region overlaps several different fetures.
+##   Has to be any combination of "Exon", "Intron", "fiveUTR", "threeUTR", "Promoter", 
+##   and "immediateDownstream".
+## - A txdb with the genomic features.
+## Output: 
+## - An array with the type of genomic feature for each input region.
+## See ?assignChromosomeRegion for more info.
+assignChromosomeRegion2 <- function (peaks.RD, proximal.promoter.cutoff = 1000L, 
+					immediate.downstream.cutoff = 1000L, precedence, TxDb) 
+{
+	if (!inherits(TxDb, "TxDb")) 
+		stop("TxDb must be an object of TxDb, \n                     try\n?TxDb\tto see more info.")
+	if (!inherits(peaks.RD, c("RangedData", "GRanges"))) 
+		stop("peaks.RD must be a GRanges object.")
+	if (!is.null(precedence)) {
+			if (!all(precedence %in% c("Exon", "Intron", "fiveUTR", 
+																 "threeUTR", "Promoter", "immediateDownstream"))) 
+			stop("precedence must be a combination of \nExons, Introns, fiveUTRs, threeUTRs, \nPromoters, immediateDownstream")
+		}
+	if (inherits(peaks.RD, "RangedData")){ 
+		peaks.RD <- as(peaks.RD, "GRanges")
+	}
+	exons <- exons(TxDb, columns = NULL)
+	introns <- unique(unlist(intronsByTranscript(TxDb)))
+	fiveUTRs <- unique(unlist(fiveUTRsByTranscript(TxDb)))
+	threeUTRs <- unique(unlist(threeUTRsByTranscript(TxDb)))
+	transcripts <- unique(transcripts(TxDb, columns = NULL))
+	options(warn = -1)
+	try({
+		promoters <- unique(promoters(TxDb, upstream = proximal.promoter.cutoff, 
+																	downstream = 0))
+		immediateDownstream <- unique(flank(transcripts, 
+																				width = immediate.downstream.cutoff, start = FALSE, 
+																				use.names = FALSE))
+	})
+	microRNAs <- tryCatch(microRNAs(TxDb), error = function(e) return(NULL))
+	tRNAs <- tryCatch(tRNAs(TxDb), error = function(e) return(NULL))
+	options(warn = 0)
+	annotation <- list(exons, introns, fiveUTRs, threeUTRs, promoters, immediateDownstream)
+	if (!is.null(microRNAs)) 
+		annotation <- c(annotation, microRNAs = microRNAs)
+	if (!is.null(tRNAs)) 
+		annotation <- c(annotation, tRNAs = tRNAs)
+	annotation <- lapply(annotation, function(.anno) {
+		mcols(.anno) <- NULL
+		.anno
+	})
+	names(annotation)[1:6] <- c("Exon", "Intron", "fiveUTR", 
+															"threeUTR", "Promoter", "immediateDownstream")
+	formatSeqnames <- function(gr) {
+		seqlevels(gr)[grepl("^(\\d+|MT|M|X|Y)$", seqlevels(gr))] <- paste("chr", 
+																																			seqlevels(gr)[grepl("^(\\d+|MT|M|X|Y)$", seqlevels(gr))], 
+																																			sep = "")
+		seqlevels(gr)[seqlevels(gr) == "chrMT"] <- "chrM"
+		trim(gr)
+	}
+	peaks.RD <- formatSeqnames(peaks.RD)
+	peaks.RD <- unique(peaks.RD)
+	annotation <- lapply(annotation, formatSeqnames)
+	annotation <- GRangesList(annotation)
+	newAnno <- c(unlist(annotation))
+	newAnno.rd <- GenomicRanges::reduce(trim(newAnno))
+	Intergenic.Region <- gaps(newAnno.rd, end = seqlengths(TxDb))
+	Intergenic.Region <- Intergenic.Region[strand(Intergenic.Region) != "*"]
+	if (!all(seqlevels(peaks.RD) %in% seqlevels(newAnno))) {
+		warning("peaks.RD has sequence levels not in TxDb.")
+		sharedlevels <- intersect(seqlevels(newAnno), seqlevels(peaks.RD))
+		peaks.RD <- keepSeqlevels(peaks.RD, sharedlevels)
+	}
+	mcols(peaks.RD) <- NULL
+	annotation <- annotation[unique(c(precedence, names(annotation)))]
+	names(Intergenic.Region) <- NULL
+	annotation$Intergenic.Region <- Intergenic.Region
+	anno.names <- names(annotation)
+	
+	ol.anno <- findOverlaps(peaks.RD, annotation)
+	ol.anno.splited <- split(queryHits(ol.anno), anno.names[subjectHits(ol.anno)])
+
+	ol.anno <- as.data.frame(ol.anno)
+	ol.anno.splited <- split(ol.anno, ol.anno[, 2])
+	hasAnnoHits <- do.call(rbind, ol.anno.splited[names(ol.anno.splited) != as.character(length(annotation))])
+	hasAnnoHits <- unique(hasAnnoHits[, 1])
+	ol.anno <- ol.anno[!(ol.anno[, 2] == length(annotation) & (ol.anno[, 1] %in% hasAnnoHits)), ]
+	ol.anno <- ol.anno[!duplicated(ol.anno[, 1]), ]
+	out.data <- names(annotation)[ol.anno$subjectHits] 
+}
+
+## Annotate DMRs, with genomic region and (possible) promoter.
+## Input:
+## - DMRs, as GRanges object
+## - Max distance to transcription start site (default 5000 bp)
+## - Annotation data as ??
+## - Annotation data as txdb
+## Output:
+## - The same GRanges object as input, but with two additional columns: 
+##   "gene_tss" (if the DMR is close to any TSS) and "genomic _feature"
+##   ("near TSS", "exon", "intron", "Intergenic.Region" etc.)
+annot.dmrs <- function(dmrs, maxgap=5000, annoData, annoData.TXDB){
+	## Find transcription start sites nearby the DMRs
+	overlaps.anno <- annotatePeakInBatch(dmrs, AnnotationData=annoData, featureType="TSS", FeatureLocForDistance="TSS", select="all", output="nearestLocation", maxgap=maxgap)
+	overlaps.anno$gene_name <- annoData$gene_name[match(overlaps.anno$feature, names(annoData))]
+	overlaps.anno <- overlaps.anno[abs(overlaps.anno$distancetoFeature)<= maxgap, ] ## Only keep nearby TSS
+	
+	## For each DMR, get names of genes with nearby TSS (if any)
+	nearest.gene <- sapply(names(dmrs),
+												 function(x){
+												 	peak.indx <- overlaps.anno$peak == x & base::grepl("ENST",overlaps.anno$feature)
+												 	paste(unique(overlaps.anno$gene_name[peak.indx]), collapse=", ")
+												 	})
+	dmrs$gene_tss <- nearest.gene
+	
+	assigned.chromosome.regions <- assignChromosomeRegion2(dmrs, precedence=c("Promoter", "immediateDownstream","fiveUTR", "threeUTR", "Exon", "Intron"), proximal.promoter.cutoff=maxgap, immediate.downstream.cutoff=maxgap, TxDb=annoData.TXDB)
+	
+	dmrs$genomic_feature <- assigned.chromosome.regions
+	
+	## Make sure the the tss annotations from annotatePeakInBatch and the assigned chromatin regions agree.
+	gene.tss.overlap <- dmrs$gene_tss != ""
+	dmrs$genomic_feature[gene.tss.overlap] <- "near TSS"
+
+	return(dmrs)
+}
+
+
+
+## Summarize probe data by gene.
+## Input:
+## - The GenomicRatioSet with the probe data.
+## - A list mapping gene id -> probe ids
+## - Which function to use for summarizing. Default is mean.
+## Output:
+## - A matrix with gene as rows, samples as column, with summarized M-values of all probes annotated 
+## to the gene in question. E.g. if the mean function is used, mean M-values over all probes for a 
+## gene are returned.
+mvals.per.gene <- function(GRset, probe.gene.map, use.function=mean){
+	filtered.map <- lapply(probe.gene.map, 
+				 function(x){
+				 	intersect(x, rownames(GRset))
+				 })
+	
+	mvals <- getM(GRset)
+	out.list <- lapply(names(filtered.map),
+										function(ensg){
+											probe.data <- mvals[filtered.map[[ensg]], ]
+											
+											if(length(nrow(probe.data)) ==0){
+												return(NULL)
+											}
+											
+											return( apply(probe.data, 2, use.function, na.rm=TRUE) )
+										})
+	names(out.list) <- names(filtered.map) 
+	out.tab <- do.call(rbind, out.list)
+	return(out.tab)
+	}
+
+
+
+## Export probe data as gzipped csv files with M-values.
+## Input:
+## - The GenomicRatioSet to export.
+## - Which probes to export.
+## - The name of the output file.
+## Output:
+## - Writes the M values from the given GenomicRatioSet to the given file.
+write.m.vals <- function(GRset, use.probes, out.file){
+	out.data <- getM(GRset)[rownames(GRset) %in% use.probes, ]
+	out.data <- round(out.data,4)
+	out.file.gz <- gzfile(out.file)
+	write.csv(out.data , file=out.file.gz)
+}
+```
+
+
+## Load data and pre-process
+```{r preprocess, message=FALSE}
+# setwd()
+set.seed(1977) ## set seed so that methods using randomization (bumphunter and SAM) always give the same results.
+
+#########################################
+## Minfi load and pre-process data
+
+## Read info on non-specific probes
+non.specific.probe.tab <- fread('https://raw.githubusercontent.com/sirselim/illumina450k_filtering/master/48639-non-specific-probes-Illumina450k.csv', header=TRUE)
+
+## Read table with info about all arrays
+targets <- read.csv(file="cedernaes2018_dnamethylation_samplesheet.csv")
+rownames(targets) <- paste(targets$Sentrix_ID, targets$Sentrix_Position, sep="_")
+targets.a <- targets[targets$Tissue=="A",]
+targets.m <- targets[targets$Tissue=="M",]
+
+## Normalize. Since there are large differences between adipose and muscle, use quantile normalization on each tissue separately.
+minfi.norm.a <- minfi.filter.and.normalize.by.tissue (targets.a, non.specific.probe.tab=non.specific.probe.tab)
+minfi.norm.m <- minfi.filter.and.normalize.by.tissue (targets.m, non.specific.probe.tab=non.specific.probe.tab)
+```
+
+
+## QC plots
+```{r qc, fig.width=7, fig.height=7, fig.align='center'}
+minfi.qc.plot.by.tissue(minfi.norm.a, sample.sheet=targets.a, tissue="Adipose (minfi)")
+minfi.qc.plot.by.tissue(minfi.norm.m, sample.sheet=targets.m, tissue="Muscle (minfi)")
+```
+
+
+## Find DMRs
+```{r dmrs, message=FALSE}
+## Get DMRs with dmrcate.
+dmrcate.minfi.dmrs.a <- dmrcate.dmrs(minfi.norm.a, sample.sheet=targets.a, use.model="~ 0 + Sleep + Subject", contrast="Sleepwake-Sleepsleep", dmr.fc=0.02)
+dmrcate.minfi.dmrs.m <- dmrcate.dmrs(minfi.norm.m, sample.sheet=targets.m, use.model="~ 0 + Sleep + Subject", contrast="Sleepwake-Sleepsleep", dmr.fc=0.02)
+
+dmrcate.minfi.dmrs.nofc.a <- dmrcate.dmrs(minfi.norm.a, sample.sheet=targets.a, use.model="~ 0 + Sleep + Subject", contrast="Sleepwake-Sleepsleep", dmr.fc=0)
+dmrcate.minfi.dmrs.nofc.m <- dmrcate.dmrs(minfi.norm.m, sample.sheet=targets.m, use.model="~ 0 + Sleep + Subject", contrast="Sleepwake-Sleepsleep", dmr.fc=0)
+```
+
+#### Find Cpgs
+There were no signficant DMRs in muscle. Therefore we also look at the the most signficant individual probes/CpGs. None of these are very signficant either (from the FDR adjusted p-value P.adj):
+```{r muscle_cpgs, message=FALSE, warning=FALSE}
+diff.cpgs(GRset=minfi.norm.m, sample.sheet=targets.m, use.model="~ 0 + Sleep + Subject", contrast="Sleepwake-Sleepsleep", nr.cpgs=10)
+```
+
+
+
+## Analyze DMRs
+
+### Get numbers of DMRs
+```{r dmr_nrs}
+pval.cutoff <- 0.05
+length(which(dmrcate.minfi.dmrs.a$meanbetafc > 0))
+length(which(dmrcate.minfi.dmrs.a$meanbetafc < 0))
+
+length(which(dmrcate.minfi.dmrs.m$meanbetafc > 0))
+length(which(dmrcate.minfi.dmrs.m$meanbetafc < 0))
+
+length(which(dmrcate.minfi.dmrs.nofc.a$meanbetafc > 0))
+length(which(dmrcate.minfi.dmrs.nofc.a$meanbetafc < 0))
+
+length(which(dmrcate.minfi.dmrs.nofc.m$meanbetafc > 0))
+length(which(dmrcate.minfi.dmrs.nofc.m$meanbetafc < 0))
+```
+
+```{r annot_dmrs, warning=FALSE}
+maxgap <- 5000
+annoData <- toGRanges(EnsDb.Hsapiens.v75, feature="transcript")
+annoData.TXDB <- makeTxDbFromGFF("/Users/orzechoj/projects/benedict2016/data/annot/Homo_sapiens.GRCh37.87.gff3.gz", format="gff3")
+
+dmrcate.minfi.dmrs.a <- annot.dmrs(dmrcate.minfi.dmrs.a, maxgap=5000, annoData, annoData.TXDB)
+dmrcate.minfi.dmrs.nofc.a <- annot.dmrs(dmrcate.minfi.dmrs.nofc.a, maxgap=5000, annoData, annoData.TXDB)
+```
+```{r heatmap_dmrs, fig.width=7, fig.height=7, fig.align='center'}
+pheno.data <- targets.a
+rownames(pheno.data) <- paste(pheno.data$Sentrix_ID, pheno.data$Sentrix_Position, sep="_")
+probeinfo <- makeGRangesFromDataFrame(minfi::getAnnotation(minfi.norm.a), start.field = "pos", end.field = "pos", keep.extra.columns=TRUE)
+
+## Plot all samples, DMRs with any fold change 
+plot.data <- t(sapply(1:length(dmrcate.minfi.dmrs.nofc.a), function(i){get.dmr.betas(dmrcate.minfi.dmrs.nofc.a, minfi.norm.a, probeinfo, i)}))
+plot.data <- plot.data[,c(seq(from=1, to=ncol(plot.data), by=2),seq(from=2, to=ncol(plot.data), by=2))]
+pheatmap(plot.data, cluster_rows=TRUE, cluster_cols=FALSE, show_colnames=FALSE, scale="row", 
+				 annotation_col=pheno.data[,c("Sleep","Subject")], main="Adipose DMRs (average Beta values)", fontsize_row=5)
+```
+
+
+
+### Plot indivudial DMRs
+
+```{r print dmr_diff_plots}
+## Which DMRs to print
+plot.names <- c("CD36", "TSPAN", "GNAS", "INS", "GFI1", "AKR1CL1", "TNXB", "TRIM2", "HOXA2","FOXP2")
+plot.dmrs <- names(dmrcate.minfi.dmrs.nofc.a[unlist(lapply(plot.names, function(x){grep(x,dmrcate.minfi.dmrs.nofc.a$gene_tss)})),] )
+names(plot.dmrs) <- plot.names
+
+## Make violin plots
+p <- lapply(1:length(plot.dmrs),
+						function(i){
+							plot.methylation.difference(GRset=minfi.norm.a, select.id=plot.dmrs[i], dmrs=dmrcate.minfi.dmrs.nofc.a, main=names(plot.dmrs)[i])
+							})
+
+ml <- marrangeGrob(p, nrow=5, ncol=2)
+print(p)
+```
+
+
+
+```{r pathway_enrich, warning=FALSE}
+## Fetch gene info.
+ensembl = useEnsembl(biomart="ensembl",GRCh=37, dataset="hsapiens_gene_ensembl")
+gene.annot.tab <- getBM(attributes=c('ensembl_gene_id','gene_biotype','entrezgene', 'external_gene_name'), mart = ensembl)
+
+## Clean up data: if there are several entries with same ensembl_gene_id, use the first
+gene.annot.tab %>%
+	group_by(ensembl_gene_id) %>%
+	summarise_each(funs(paste(sort(.), collapse=","))) %>%
+	extract(external_gene_name, "external_gene_name", "([^,]+),?.*") %>%
+	extract(gene_biotype, "gene_biotype", "([^,]+),?.*") %>%
+	extract(entrezgene, "entrezgene", "([^,]+),?.*") -> gene.annot.tab
+
+
+## Create genomic ranges object from info about 450K probes 
+ann450k = minfi::getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+cpgData <- GRanges(seqnames=Rle(ann450k$chr),
+									 ranges=IRanges(start=ann450k$pos, end=ann450k$pos),
+									 strand=Rle(rep("*",nrow(ann450k))))
+names(cpgData) <- rownames(ann450k)
+
+## Get all genes that have 450K probes in promoters
+probe.gene.overlaps <- annotate.regions.to.tss(cpgData, maxgap=5000, annoData)
+close.to.probe.ensembl <- probe.gene.overlaps[[1]]
+probes.near.genes <- probe.gene.overlaps[[2]]
+probe.gene.map <- probe.gene.overlaps[[3]]
+```
+
+## Fisher test against Gene Ontology and KEGG gene sets
+
+Using topGO and topKEGG from limma.
+
+### Pathways enriched in genes close to any adipose DMRs
+```{r pathways_all_dmrs}
+## Get enriched pathways etc. in genes close to hypermethylated adipose DMRs
+enriched.terms.a.no.fc <- dmr.go.kegg(dmrcate.minfi.dmrs.nofc.a, close.to.probe.ensembl, gene.annot.tab, annoData, fisher.cutoff=0.01, min.genes = 3)
+```
+
+
+## Pathways enriched in close to hypomethylated adipose DMRs
+```{r pathways_down_dmrs}
+enriched.terms.a.down.no.fc <- dmr.go.kegg(dmrcate.minfi.dmrs.nofc.a[dmrcate.minfi.dmrs.nofc.a$meanbetafc <0,], 
+																close.to.probe.ensembl, gene.annot.tab, annoData, fisher.cutoff=0.01, min.genes = 3)
+
+```
+
+
+## Pathways enriched in close to hypermethylated adipose DMRs
+```{r pathways_up_dmrs}
+enriched.terms.a.up.no.fc <- dmr.go.kegg(dmrcate.minfi.dmrs.nofc.a[dmrcate.minfi.dmrs.nofc.a$meanbetafc >0,], 
+																close.to.probe.ensembl, gene.annot.tab, annoData, fisher.cutoff=0.01, min.genes = 3)
+```
+
+## Enrichr
+
+Enrichr ia a web tool where you can upload lists of genes, and look for overlaps with gene sets from many different sources (Gene Ontology, KEGG, Wikipathays, ENCODE, GTEx). The tool can be found at http://amp.pharm.mssm.edu/Enrichr/. The following code generates gene lists that can be pasted into the web form.
+
+```{r enrichr_genes}
+write.table(dmrcate.minfi.dmrs.a[dmrcate.minfi.dmrs.a$meanbetafc > 0,]$gene_tss, row.names = F, col.names = F, quote = F)
+write.table(dmrcate.minfi.dmrs.a[dmrcate.minfi.dmrs.a$meanbetafc < 0,]$gene_tss, row.names = F, col.names = F, quote = F)
+write.table(dmrcate.minfi.dmrs.a$gene_tss, row.names = F, col.names = F, quote = F)
+```
+
+Uploading the lists to Enrichr gave the following results:
+
+- Adipose down http://amp.pharm.mssm.edu/Enrichr/enrich?dataset=3hvym
+
+- Adipose up http://amp.pharm.mssm.edu/Enrichr/enrich?dataset=3hvxp
+
+- Adipose all http://amp.pharm.mssm.edu/Enrichr/enrich?dataset=3hvz1
+
+
+
+### Print tables with DMRs and probes
+```{r dmr_write}
+write.table(as.data.frame(dmrcate.minfi.dmrs.a[dmrcate.minfi.dmrs.a$meanbetafc > 0,]), sep="\t", quote=F, row.names=F, file="./minfi_dmrcate_a_up.txt")
+write.table(as.data.frame(dmrcate.minfi.dmrs.a[dmrcate.minfi.dmrs.a$meanbetafc < 0,]), sep="\t", quote=F, row.names=F, file="./minfi_dmrcate_a_down.txt")
+
+write.table(as.data.frame(dmrcate.minfi.dmrs.nofc.a[dmrcate.minfi.dmrs.nofc.a$meanbetafc > 0,]), sep="\t", quote=F, row.names=F, file="./minfi_dmrcate_nofc_cutoff_a_up.txt")
+write.table(as.data.frame(dmrcate.minfi.dmrs.nofc.a[dmrcate.minfi.dmrs.nofc.a$meanbetafc < 0,]), sep="\t", quote=F, row.names=F, file="./minfi_dmrcate_nofc_cutoff_a_down.txt")
+```
+
+
+Here we summarize the probe data by gene. For each gene, we use the mean M value of all probes annotated to that gene.
+
+```{r summarize_probe_data}
+mvals.per.gene <- function(GRset, probe.gene.map, use.function=mean){
+	filtered.map <- lapply(probe.gene.map, 
+				 function(x){
+				 	intersect(x, rownames(GRset))
+				 })
+	
+	mvals <- getM(GRset)
+	out.list <- lapply(names(filtered.map),
+										function(ensg){
+											probe.data <- mvals[filtered.map[[ensg]], ]
+											
+											if(length(nrow(probe.data)) ==0){
+												return(NULL)
+											}
+											
+											return( apply(probe.data, 2, use.function, na.rm=TRUE) )
+										})
+	names(out.list) <- names(filtered.map) 
+	out.tab <- do.call(rbind, out.list)
+	return(out.tab)
+	}
+# This takes around 1 hour for each tissue, so it's commented out at the moment.
+# mvals.per.gene.adipose <- mvals.per.gene(minfi.norm.a, probe.gene.map, use.function=mean)
+# mvals.per.gene.muscle <- mvals.per.gene(minfi.norm.m, probe.gene.map, use.function=mean)
+#
+# write.csv(mvals.per.gene.adipose, file="gene_mean_mvals_adipose.csv",  quote=FALSE)
+# write.csv(mvals.per.gene.muscle, file="gene_mean_mvals_muscle.csv",  quote=FALSE)
+```
+
+Finally, we export the M values as csv files. Since all probes overlppaoing SNPs have been filtered out, these data can be shared freely.
+
+```{r export_probe_data, warning=FALSE}
+write.m.vals(minfi.norm.a, probes.near.genes, "./gene_mvals_adipose.csv.gz")
+write.m.vals(minfi.norm.m, probes.near.genes, "./gene_mvals_muscle.csv.gz")
+
+write.m.vals(minfi.norm.a, rownames(getM(minfi.norm.a)), "./non_snp_mvals_adipose.csv.gz")
+write.m.vals(minfi.norm.m, rownames(getM(minfi.norm.m)), "./non_snp_mvals_muscle.csv.gz")
+```
+
+## Session info
+```{r session_info}
+R.Version() 
+sessionInfo(package = NULL)
+```

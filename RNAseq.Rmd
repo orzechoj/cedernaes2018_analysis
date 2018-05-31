@@ -1,0 +1,467 @@
+---
+title: "Differential expression for sleep deprivation RNA-seq."
+author: "Jakub Orzechowski Westholm"
+output:
+  html_document: default
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '~/tmp/') ## Change this to appropriate directory
+```
+
+```{r date}
+cat(paste(Sys.Date()))
+```
+
+This document contains the RNA-seq analysis for the study by Cedernaes et al. 2018. 
+
+### Load libraries
+```{r libs, results='hide', message=FALSE, warning=FALSE}
+library(knitr)
+library(edgeR)
+library(biomaRt)
+library(tidyverse)
+library(gage)
+library(gageData)
+library(pathview)
+library(VennDiagram)
+library(pheatmap)
+```
+
+
+### Helper functions
+```{r functions}
+# Run differential expression analysis with EdgeR.
+# Inputs:
+# - a count table (rows are genes, columns are samples)
+# - which model to use (a string representing a formula)
+# - a table with phenotype data (rows are samples, columns are phenotypes etc.)
+# - minimum threshold of counts per million (CPM) for filtering genes (default=1)
+# - minimum number of samples a gene has to have CPM above the given threshold (default=5)
+# - if coeficiant of variation should be plotted (default=TRUE)
+# - the highest p-value to include in the output (default=1, include all genes)
+# - an array mapping ENSG ids to gene names
+# - an array mapping ENSG ids to Entrez ids
+# Output:
+# - A table of differential expression results, with the following columns:
+# "logFC", "logCPM", "LR", "PValue", "FDR", "gene_names", "entrez" 
+run.edger.analys <- function(use.counts, use.model, sample.tab, min.cpm=1, min.samples=5, 
+														 plot.bcv=TRUE, max.pval=1, genenames=NULL, entrez=NULL){
+	
+	y <- DGEList(counts=use.counts)
+
+	keep <- rowSums(cpm(y)>min.cpm) >= min.samples 
+	y <- y[keep, keep.lib.sizes=FALSE]
+	
+	use.sample.tab <- sample.tab[colnames(use.counts),]
+	
+	design <- model.matrix(as.formula(use.model), data=use.sample.tab )
+
+	## Normalize
+	y <- calcNormFactors(y)
+	
+	## Estimating disperions
+	y <- estimateGLMCommonDisp(y,design)
+	y <- estimateGLMTrendedDisp(y,design)
+	y <- estimateGLMTagwiseDisp(y,design)
+
+ 	if(plot.bcv){
+ 		plotBCV(y)
+ 	}
+
+	## Testing for differential expression
+	fit <- glmFit(y, design)
+	lrt <- glmLRT(fit)
+	
+	out.tab <- topTags(lrt, n=1000000, p.value=max.pval)$table
+
+	## Add gene info
+	if(!is.null(genenames)){
+		out.tab <- cbind(out.tab, gene_names=genenames[rownames(out.tab)])
+	}
+	if(!is.null(entrez)){
+		out.tab <- cbind(out.tab, entrez=entrez[rownames(out.tab)])
+	}
+	return(out.tab)
+}
+
+
+
+# Volcano plot: log fold change on x-axis and -log (pval) on y-axis.
+# Input:
+# - Table with differential expression (with log fold change on col 1 and p-val in col 5)
+# - p-value threshold
+# - fold change threshold
+# - Title
+# Plots a volcano plot. Genes above the thresholds are highlighted with different colors.
+volcano.plot <- function(top.tab, pval.cutoff=0.05, fc.cutoff=1, main=""){
+	res <- cbind(top.tab[,1],-log10(top.tab[,5]))
+	rownames(res) <- rownames(top.tab)
+	colnames(res) <- c("logFC", ylab="-log10(P)")
+	
+	plot(res, pch=20, cex=0.5, xlab="logFC", ylab="-log10 P",main=main)
+	
+	# Add colored points: red if padj<0.05, orange of log2FC>1, green if both)
+	points(subset(res, res[,2] > -1* log10(pval.cutoff) ), pch=20, cex=0.5, col="red")
+	points(subset(res, abs(res[,1]) > fc.cutoff), pch=20, cex=0.5, col="green")
+}
+
+
+# Run GAGE pathway anslysis.
+# Input:
+# - Table with differential expression, with the following columns:
+#   "logFC", "logCPM", "LR", "PValue", "FDR", "gene_names", "entrez"
+# - List of gene sets, mapping gene set name to Entrez gene ids.
+# - Wich measure to use, "logFC" or "logP" ( -1*log(P)*sign(logFC) )
+# Output is a list with 3 elements ("greater", "less", "stats"), output by gage. 
+# See ?gage for more info.
+run.gage <- function(top.tab, gene.sets, measure="logFC"){
+	use.genes <- !is.na(top.tab$entrez)
+	
+	use.measure <- NULL
+	if(measure=="logFC"){
+		use.measure <- top.tab$logFC[use.genes]
+	}
+	if(measure=="logP"){
+		use.measure <- sign(top.tab$logFC[use.genes])*-1*log10(top.tab$PValue[use.genes])
+	}
+	names(use.measure) <- top.tab$entrez[use.genes]
+	return( gage(use.measure, gsets = gene.sets, ref = NULL, samp = NULL, use.fold = TRUE, saaTest = gs.KSTest, rank.test = TRUE) )
+} 
+
+
+# Print top gene sets from GAGE analysis.
+# Input:
+# - output from GAGE
+# - threshold on the q-value (default=0.01)
+# - direction of change ("up" or "down")
+top.gage.sets <- function(gage.data, qval.threshold=0.05, change){
+	use.cols <- c(2,4,5)
+		tmp.data <- NULL
+	if(change=="up"){
+		tmp.data <- gage.data[[1]]
+	}
+	else if(change=="down"){
+		tmp.data <- gage.data[[2]]
+	}else{
+		stop(paste("Error in top.gage.sets! Expected change=\"up\" or \"down\", got", change))
+	}
+	
+	# Format output, round numbers and truncate long strings.
+	out.tab <- tmp.data[which(tmp.data[,"q.val"] < qval.threshold), use.cols ] 
+	
+	if(!is.null(dim(out.tab))){ 
+			if(nrow(out.tab) == 0){ 
+				return(out.tab) 
+			}
+	}
+	if(is.null(dim(out.tab))){ # ugly hack to catch error if there's only one gene set.
+		out.tab <- as.data.frame(t(out.tab))
+		rownames(out.tab) <- rownames(tmp.data)[which(tmp.data[,"q.val"] < qval.threshold)]
+	}
+	
+	
+	rownames(out.tab) <- strtrim(rownames(out.tab), 50)
+ 	out.tab[,"stat.mean"] <- round(out.tab[,"stat.mean"], 2)
+	out.tab[,"q.val"] <- signif(out.tab[,"q.val"], 2)
+	return( out.tab )
+}
+
+
+## Compared differentially expressed genes in two tissues, and plot a Venn diagram. Input:
+## - EdgeR output for tissue 1 (adipose)
+## - EdgeR output for tissue 2 (muscle)
+## Output:
+## - Venn diagram with overlaps between up- and down.regulated genes in the two tissues.
+compare.tissues.venn <- function(edger.a, edger.m, max.pval){
+	a.up.genes <- rownames(edger.a[which(edger.a$FDR < max.pval & edger.a$logFC > 0),])
+	a.down.genes <- rownames(edger.a[which(edger.a$FDR < max.pval & edger.a$logFC < 0),])
+
+	m.up.genes <- rownames(edger.m[which(edger.m$FDR < max.pval & edger.m$logFC > 0),])
+	m.down.genes <- rownames(edger.m[which(edger.m$FDR < max.pval & edger.m$logFC < 0),])
+
+	draw.quad.venn(
+		area1 = length(a.up.genes),
+		area2 = length(a.down.genes),
+		area3 = length(m.up.genes),
+		area4 = length(m.down.genes),
+		n12 = 0,
+		n13 = length(intersect(a.up.genes, m.up.genes)),
+		n14 = length(intersect(a.up.genes, m.down.genes)),
+		n23 = length(intersect(a.down.genes, m.up.genes)),
+		n24 = length(intersect(a.down.genes, m.down.genes)),
+		n34 = 0,
+		n123 = 0,
+		n124 = 0,
+		n134 = 0,
+		n234 = 0,
+		n1234 = 0,
+		category = c("Adipose Up", "Adipose Down", "Muscle Up", "Muscle down"),
+		fill = c("orange", "red", "green", "blue"),
+		lty = "blank",
+		cex = 1.4,
+		cat.cex = 1.3,
+		cat.col = rep("black", 4)
+	)
+}
+```
+
+
+### Load and organize data
+```{r load_data}
+## read gene counts
+gene.count.file <- "all_counts.txt"
+count.tab <- read.table(gene.count.file, sep="\t", header=TRUE)
+colnames(count.tab) <- gsub("^X", "", colnames(count.tab), perl=TRUE) # Clean up column names in count table
+
+## Read sample sheet
+sample.file <- "rna_seq_data_table.csv"
+sample.tab <- read.csv(sample.file, as.is = TRUE)
+rownames(sample.tab) <- gsub("\"", "", apply(sample.tab[,3:1], 1, function(x){paste(x,collapse = ".")})) # Clean up row names in sample sheet
+head(sample.tab)
+
+## Fetch gene info. Run this once. Then just reload saved object.
+ensembl = useEnsembl(biomart="ensembl",GRCh=37, dataset="hsapiens_gene_ensembl")
+gene.annot.tab <- getBM(attributes=c('ensembl_gene_id','gene_biotype','entrezgene', 'external_gene_name'), mart = ensembl)
+
+## Clean up data: if there are several entries with same ensembl_gene_id, use the first
+gene.annot.tab %>%
+	group_by(ensembl_gene_id) %>%
+	summarise_each(funs(paste(sort(.), collapse=","))) %>%
+	extract(external_gene_name, "external_gene_name", "([^,]+),?.*") %>%
+	extract(gene_biotype, "gene_biotype", "([^,]+),?.*") %>%
+	extract(entrezgene, "entrezgene", "([^,]+),?.*") -> gene.annot.tab
+head(gene.annot.tab)
+
+biotypes <- gene.annot.tab$gene_biotype 
+names(biotypes) <- gene.annot.tab$ensembl_gene_id
+
+genenames <- gene.annot.tab$external_gene_name
+names(genenames) <- gene.annot.tab$ensembl_gene_id
+
+entrez <- gene.annot.tab$entrezgene
+names(entrez) <- gene.annot.tab$ensembl_gene_id
+
+protein.coding.genes <- names(biotypes)[biotypes == "protein_coding"]
+```
+
+Select gene expression data to look at
+```{r filter_data}
+gene.filter <- protein.coding.genes
+count.filtered <- count.tab[intersect(rownames(count.tab),gene.filter),]
+
+count.filtered.a <- count.filtered[, grep(".A", colnames(count.filtered), fixed = TRUE)]
+count.filtered.m <- count.filtered[, grep(".M", colnames(count.filtered), fixed = TRUE)]
+```
+
+# Differential expression with EdgeR
+```{r edger}
+use.model <- "~Subject_ID + Sleep"
+
+min.cpm <- 1
+min.samples <- 5
+edger.a <- run.edger.analys(count.filtered.a, use.model, sample.tab, min.cpm=min.cpm, min.samples=min.samples, genenames=genenames, entrez=entrez)
+edger.m <- run.edger.analys(count.filtered.m, use.model, sample.tab, min.cpm=min.cpm, min.samples=min.samples, genenames=genenames, entrez=entrez)
+
+head(edger.a)
+```
+Number of differentially expressed genes
+```{r nr_genes}
+max.pval <- 0.05
+length(which(edger.a$FDR < max.pval))
+length(which(edger.m$FDR < max.pval))
+```
+Write lists of differentially expressed genes to text files.
+```{r gene_lists}
+write.table(edger.a[edger.a$FDR < 0.05 & edger.a$logFC > 0,], file="adipose_up.txt", row.names = T, col.names = T, quote = F)
+write.table(edger.a[edger.a$FDR < 0.05 & edger.a$logFC < 0,], file="adipose_down.txt", row.names = T, col.names = T, quote = F)
+
+write.table(edger.m[edger.m$FDR < 0.05 & edger.m$logFC > 0,], file="muscle_up.txt", row.names = T, col.names = T, quote = F)
+write.table(edger.m[edger.m$FDR < 0.05 & edger.m$logFC < 0,], file="muscle_down.txt", row.names = T, col.names = T, quote = F)
+```
+
+
+# Overlaps between differentially regulated genes from adipse and muscle
+```{r tissue_overlaps, fig.width=10, fig.height=10, fig.align='center', results=FALSE}
+compare.tissues.venn(edger.a, edger.m, max.pval)
+```
+
+## Volcano plots
+```{r volcano_plots, fig.width=14, fig.height=7, fig.align='center'}
+par(mfrow=c(1,2))
+volcano.plot(edger.a, pval.cutoff=0.05, fc.cutoff=1, main="Adipose")
+volcano.plot(edger.m, pval.cutoff=0.05, fc.cutoff=1, main="Muscle")
+```
+
+## Heatmaps of differentially expressed genes
+```{r heatmaps_all_de, fig.width=3, fig.height=10, fig.align='center'}
+scale_rows = function(x){
+	m = apply(x, 1, mean, na.rm = T)
+	s = apply(x, 1, sd, na.rm = T)
+	return((x - m) / s)
+}
+
+## Calculate log CPM (counts per million mapped reads)
+logcpm.a <- cpm(DGEList(count.filtered.a), prior.count=2, log=TRUE)
+logcpm.m <- cpm(DGEList(count.filtered.m), prior.count=2, log=TRUE)
+rownames(logcpm.a) <- genenames[rownames(logcpm.a)]
+rownames(logcpm.m) <- genenames[rownames(logcpm.m)]
+
+## Reorder columns, and rescale (to mean=0 and sd=1)
+plot.data.a <- logcpm.a[,c(seq(from=1, to=30,by=2), seq(from=2, to=30, by=2))]
+plot.data.m <- logcpm.m[,c(seq(from=1, to=30,by=2), seq(from=2, to=30, by=2))]
+plot.data.am <- cbind(scale_rows(plot.data.a), scale_rows(plot.data.m))
+
+
+pval.cutoff = 0.05
+use.genes.a <- genenames[rownames(edger.a)[edger.a$FDR<pval.cutoff]]
+use.genes.m <- genenames[rownames(edger.m)[edger.m$FDR<pval.cutoff]]
+use.genes.am <- union(use.genes.a, use.genes.m)
+names(use.genes.am) <- use.genes.am
+
+
+## Plot (rescaled) expression levels
+de.exp <- cbind(adipose_sms=apply(plot.data.a[use.genes.am,1:15],1,mean),
+								adipose_smw=apply(plot.data.a[use.genes.am,16:30],1,mean),
+								muscle_sms=apply(plot.data.m[use.genes.am,1:15],1,mean),
+								muscle_smw=apply(plot.data.m[use.genes.am,16:30],1,mean))
+pheatmap(de.exp[use.genes.a,], cluster_rows=TRUE, cluster_cols=FALSE, scale="row", 
+				 annotation_col=NULL, main="Diff exp genes in adipose", fontsize_row=5)
+
+pheatmap(de.exp[use.genes.m,], cluster_rows=TRUE, cluster_cols=FALSE, scale="row", 
+				 annotation_col=NULL, main="Diff exp genes in muscle", fontsize_row=5)
+
+
+## Plot log fold changes
+de.diff.exp.a <- do.call("cbind", lapply(seq(from=1, to=30, by=2), function(i){ logcpm.a[use.genes.am ,i+1] - logcpm.a[use.genes.am ,i] }))
+de.diff.exp.m <- do.call("cbind", lapply(seq(from=1, to=30, by=2), function(i){ logcpm.m[use.genes.am ,i+1] - logcpm.m[use.genes.am, i] }))
+de.diff.exp <- cbind(adipose=apply(de.diff.exp.a,1,mean),
+										 muscle=apply(de.diff.exp.m,1,mean))
+de.diff.exp <- de.diff.exp[order(apply(de.diff.exp,1,mean)),] ## Order on average fc
+
+
+paletteLength <- 50
+myColor <- colorRampPalette(c("red", "white", "blue"))(paletteLength)
+max.fc <- ceiling(max(abs(de.diff.exp)))
+pheatmap(de.diff.exp[use.genes.a,], cluster_rows=TRUE, cluster_cols=FALSE, scale="none", annotation_col=NULL, main="Diff exp genes in adipose, log fc", fontsize_row=5, color = myColor, breaks = seq(from=-1*max.fc, to=max.fc, length.out=paletteLength))
+
+pheatmap(de.diff.exp[use.genes.m,], cluster_rows=TRUE, cluster_cols=FALSE, scale="none", annotation_col=NULL, 
+				 main="Diff exp genes in muscle, log fc", fontsize_row=5, color = myColor, breaks = seq(from=-1*max.fc, to=max.fc, length.out=paletteLength))
+```
+
+
+
+
+```{r heatmap_circadian, fig.width=3, fig.height=8, fig.align='center'}
+## Plot core circadian genes
+
+core.circadian.genes <- c("TEF", "CRY2", "HLF", "BHLHE41", "CRY1", "RORB", "CLOCK", "PER2", "PER1", "NFIL3", "DBP", "NR1D2", "NR1D1", "NPAS2", "RORC", "PER3", "RORA", "BHLHE40", "ARNTL")
+names(core.circadian.genes) <- c("ENSG00000167074", "ENSG00000121671", "ENSG00000108924", "ENSG00000123095", "ENSG00000008405", "ENSG00000198963", "ENSG00000134852", "ENSG00000132326", "ENSG00000179094", "ENSG00000165030", "ENSG00000105516", "ENSG00000174738", "ENSG00000126368", "ENSG00000170485", "ENSG00000143365", "ENSG00000049246", "ENSG00000069667", "ENSG00000134107", "ENSG00000133794")
+
+core.circ.exp <- cbind(adipose_sms=apply(plot.data.a[core.circadian.genes,1:15],1,mean),
+											 adipose_smw=apply(plot.data.a[core.circadian.genes,16:30],1,mean),
+											 muscle_sms=apply(plot.data.m[core.circadian.genes,1:15],1,mean),
+											 muscle_smw=apply(plot.data.m[core.circadian.genes,16:30],1,mean))
+pheatmap(core.circ.exp, cluster_rows=TRUE, cluster_cols=FALSE, scale="none", 
+				 annotation_col=NULL, main="Core circadian genes", fontsize_row=5)
+
+
+core.circ.diff.exp.a <- do.call("cbind", lapply(seq(from=1, to=30, by=2), function(i){ logcpm.a[core.circadian.genes,i+1] -  logcpm.a[core.circadian.genes,i] }))
+core.circ.diff.exp.m <- do.call("cbind", lapply(seq(from=1, to=30, by=2), function(i){ logcpm.m[core.circadian.genes,i+1] - logcpm.m[core.circadian.genes,i] }))
+core.circ.diff.exp <- cbind(adipose=apply(core.circ.diff.exp.a,1,mean),
+														muscle=apply(core.circ.diff.exp.m,1,mean))
+core.circ.diff.exp <- core.circ.diff.exp[order(apply(core.circ.diff.exp,1,mean)),] ## Order on average fc
+
+paletteLength <- 50
+myColor <- colorRampPalette(c("red", "white", "blue"))(paletteLength)
+max.fc <- ceiling(max(abs(core.circ.diff.exp)))
+pheatmap(core.circ.diff.exp, cluster_rows=FALSE, cluster_cols=FALSE, scale="none", 
+				 annotation_col=NULL, main="Core circadian, log fc", fontsize_row=5,
+				 color = myColor,
+				 breaks = seq(from=-1*max.fc, to=max.fc, length.out=paletteLength))
+
+```
+
+# Pathway analysis
+
+Here we combine the information from individual genes, to see if any groups of genes (representing pathways, complexes, biological finctions etc.) show differential expression. We try two different approaches:
+
+
+
+## Enrichr
+Enrichr ia a web tool where you can upload lists of genes, and look for overlaps with gene sets from many different sources (Gene Ontology, KEGG, Wikipathays, ENCODE, GTEx). The tool can be found at http://amp.pharm.mssm.edu/Enrichr/. The following code generates gene lists that can be pasted into the web form.
+```{r enrichr}
+a.up.genes <- edger.a$gene_names[edger.a$FDR < 0.05 & edger.a$logFC > 0]
+a.down.genes <- edger.a$gene_names[edger.a$FDR < 0.05 & edger.a$logFC < 0]
+
+m.up.genes <- edger.m$gene_names[edger.m$FDR < 0.05 & edger.m$logFC > 0]
+m.down.genes <- edger.m$gene_names[edger.m$FDR < 0.05 & edger.m$logFC < 0]
+
+write.table(a.up.genes, row.names = F, col.names = F, quote = F) ## up DE genes from adipose
+write.table(a.down.genes, row.names = F, col.names = F, quote = F) ## down DE genes from adipose
+write.table(union(a.down.genes, a.up.genes), row.names = F, col.names = F, quote = F) ## all DE genes from adipose
+
+write.table(m.up.genes, row.names = F, col.names = F, quote = F) ## up DE genes from muscle
+write.table(m.down.genes, row.names = F, col.names = F, quote = F) ## down DE genes from muscle
+write.table(union(m.down.genes, m.up.genes), row.names = F, col.names = F, quote = F) ## all DE genes from muscle
+```
+
+Uploading the lists to Enrichr gave the following results:
+
+- Adipose down http://amp.pharm.mssm.edu/Enrichr/enrich?dataset=1ajz2
+
+- Adipose up http://amp.pharm.mssm.edu/Enrichr/enrich?dataset=1ajyy
+
+- Adipose all http://amp.pharm.mssm.edu/Enrichr/enrich?dataset=3hpvs
+
+
+- Muscle down http://amp.pharm.mssm.edu/Enrichr/enrich?dataset=1ajyk
+
+- Muscle up http://amp.pharm.mssm.edu/Enrichr/enrich?dataset=1ajyb
+
+- Muscle all http://amp.pharm.mssm.edu/Enrichr/enrich?dataset=3hpvw
+
+
+## GAGE
+GAGE is an R package that does GSEA (gene set enrichment analysis).
+
+First, load pre-processed Gene Ontology and KEGG gene annotations:
+```{r gage_data, results='hide', message=FALSE, warning=FALSE}
+data(kegg.sets.hs)
+data(sigmet.idx.hs)
+kegg.sigmet.hs=kegg.sets.hs[sigmet.idx.hs] # only use KEGG pathways related to signalling and metabolism
+
+data(go.sets.hs)
+data(go.subs.hs)
+go.mf.hs=go.sets.hs[go.subs.hs$MF]
+go.bp.hs=go.sets.hs[go.subs.hs$BP]
+go.cc.hs=go.sets.hs[go.subs.hs$CC]
+```
+
+Then look for differentially regulated pathways, using the log fold change.
+
+```{r gage_analysis_logfc}
+## Adipose
+kegg.gsea.fc.adipose <- run.gage(top.tab=edger.a, gene.sets=kegg.sigmet.hs, measure="logFC")
+go.bp.gsea.fc.adipose <- run.gage(top.tab=edger.a, gene.sets=go.bp.hs, measure="logFC")
+go.mf.gsea.fc.adipose <- run.gage(top.tab=edger.a, gene.sets=go.mf.hs, measure="logFC")
+go.cc.gsea.fc.adipose <- run.gage(top.tab=edger.a, gene.sets=go.cc.hs, measure="logFC")
+
+## Muscle
+kegg.gsea.fc.muscle <- run.gage(top.tab=edger.m, gene.sets=kegg.sigmet.hs, measure="logFC")
+go.bp.gsea.fc.muscle <- run.gage(top.tab=edger.m, gene.sets=go.bp.hs, measure="logFC")
+go.mf.gsea.fc.muscle <- run.gage(top.tab=edger.m, gene.sets=go.mf.hs, measure="logFC")
+go.cc.gsea.fc.muscle <- run.gage(top.tab=edger.m, gene.sets=go.cc.hs, measure="logFC")
+```
+
+
+# Session info
+```{r session_info}
+R.Version() 
+sessionInfo(package = NULL)
+```
+
+
